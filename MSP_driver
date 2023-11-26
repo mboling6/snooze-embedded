@@ -1,0 +1,220 @@
+#include "msp.h"
+#include "driverlib.h"
+#include "stdio.h"
+ 
+ 
+//GLOBAL VARIABLES
+uint32_t SMCLK_divider = CS_CLOCK_DIVIDER_1 ;
+volatile unsigned int VoiceMic = 0 ;
+volatile unsigned int ErrorMic = 0 ;
+#define timerA_divider   TIMER_A_CLOCKSOURCE_DIVIDER_1   // Means counter is incremented at 3E+6/64 = 46875 Hz
+#define timerA_period    75
+#define dacAddress 0x90 //Device Address
+ 
+ 
+// LMS FILTER VARIABLES
+#define LMS_FILTER_LENGTH 32  // Choose a suitable filter length
+double lmsFilterWeights[LMS_FILTER_LENGTH];  // Filter weights
+double lmsFilterOutput;  // Filter output
+double d = 0.0; // Simulating silence
+double mu = 0.01; // Adjust as needed
+int N = 16; // Adjust as needed
+int xlen = 16; // Length of your input data buffer. Set this appropriately
+#define BUFFER_SIZE 32 ;
+ 
+// Define buffers with global scope
+double x_buffer[BUFFER_SIZE];
+double e_buffer[BUFFER_SIZE];
+double d_buffer[BUFFER_SIZE];
+ 
+// Initialize indices
+int x_index = 0;
+int e_index = 0;
+int d_index = 0;
+ 
+ 
+// Timer A Config, Sampling rate = DCO_Freq/(period*divider)
+const Timer_A_UpModeConfig upConfig_0 = // Configure counter in Up mode
+{   TIMER_A_CLOCKSOURCE_SMCLK,              // Tie Timer A to SMCLK
+    timerA_divider,                         // Increment counter every 64 clock cycles
+    timerA_period,                          // Period of Timer A (this value placed in TAxCCR0)
+    TIMER_A_TAIE_INTERRUPT_DISABLE,         // Disable Timer A rollover interrupt
+    TIMER_A_CCIE_CCR0_INTERRUPT_ENABLE,     // Enable Capture Compare interrupt
+    TIMER_A_DO_CLEAR                        // Clear counter upon initialization
+};
+ 
+//I2C Master Configuration Parameter
+const eUSCI_I2C_MasterConfig i2cConfig =
+{
+EUSCI_B_I2C_CLOCKSOURCE_SMCLK,               // SMCLK Clock Source
+1000000,                                // SMCLK
+EUSCI_B_I2C_SET_DATA_RATE_100KBPS,      // Desired I2C Clock of 400khz
+0,                                      // No byte counter threshold
+EUSCI_B_I2C_NO_AUTO_STOP                // No Autostop
+};
+ 
+//Function to initialize I2C communication
+void initI2C() {
+ 
+    // Initialize GPIO pins for the B1 I2C module
+    GPIO_setAsPeripheralModuleFunctionInputPin(GPIO_PORT_P6, GPIO_PIN4 | GPIO_PIN5, GPIO_PRIMARY_MODULE_FUNCTION);
+ 
+    // Initialize the B1 Module using the I2C configuration structure
+    I2C_initMaster(EUSCI_B1_BASE, &i2cConfig);
+    I2C_setMode(EUSCI_B1_BASE, EUSCI_B_I2C_TRANSMIT_MODE);
+    I2C_enableModule(EUSCI_B1_BASE);
+ 
+    // Initialize the Slave for read operations
+    I2C_setSlaveAddress(EUSCI_B1_BASE, dacAddress);       // Set the Slave address
+    I2C_setMode(EUSCI_B1_BASE, EUSCI_B_I2C_TRANSMIT_MODE);   // Set the Master to TRANSMIT mode
+}
+ 
+//Function to initialize 2 pin ADC conversion
+void initADC() {
+    // ****** ADC Configuration ***** //
+    // Step 1: Select the input pin; set functionality of pin P5.5
+    GPIO_setAsPeripheralModuleFunctionInputPin(GPIO_PORT_P5,GPIO_PIN5 | GPIO_PIN4, GPIO_TERTIARY_MODULE_FUNCTION);
+    // Step 2: Enable ADC module
+    ADC14_enableModule();
+    // Step 3: Set to 14 bit resolution
+    ADC14_setResolution(ADC_14BIT);
+    // Step 4: Tie the ADC to SMCLK with no divider
+    ADC14_initModule(ADC_CLOCKSOURCE_SMCLK,ADC_PREDIVIDER_1,ADC_DIVIDER_1, false);
+    // Step 5: Configure sampling mode; place result of conversion in ADC_MEM0 register. We will trigger each conversion manually
+    ADC14_configureMultiSequenceMode(ADC_MEM0,ADC_MEM1,true);
+    // Step 6: Configure conversion memory; sample Channel 0 to register ADC_MEM0. Use 0-3.3V range.
+    ADC14_configureConversionMemory(ADC_MEM0, ADC_VREFPOS_AVCC_VREFNEG_VSS, ADC_INPUT_A0, false);
+    ADC14_configureConversionMemory(ADC_MEM1, ADC_VREFPOS_AVCC_VREFNEG_VSS, ADC_INPUT_A1, false);
+    // We will trigger each conversion manually
+    ADC14_enableSampleTimer(ADC_MANUAL_ITERATION);
+    // Start conversion
+    ADC14_enableConversion();        // Sets the ENC bit
+    ADC14_toggleConversionTrigger(); // Sets the SC bit (trigger)
+}
+ 
+ 
+void donlms(double *x, double *d, double *dhat, double *e, double *w, double mu, int N, int xlen);
+ 
+void main(void)
+{
+    //Clock Setup
+    WDT_A_holdTimer();                  // Stop watchdog timer
+    Interrupt_disableMaster();
+    CS_setDCOFrequency(3E+6);           // Set DCO to 3 MHz. WARNING, if 48MHz, there is a special, different setup
+    CS_initClockSignal(CS_SMCLK, CS_DCOCLK_SELECT, SMCLK_divider); //ties physical clock to digital clock. Note SMCLK_divider is 1, so the digital clock rate is the same as the physical clock rate
+    initI2C();
+    initADC();
+    ///// *** Configure Timer A and its interrupt *** /////
+    Timer_A_configureUpMode(TIMER_A0_BASE, &upConfig_0);
+    Interrupt_enableInterrupt(INT_TA0_0);
+    Timer_A_startCounter(TIMER_A0_BASE, TIMER_A_UP_MODE);
+    // Enable timer interrupt
+    Interrupt_enableMaster();       // Enable all interrupts
+ 
+ 
+    // Initialize LMS filter weights to zero
+    for (int i = 0; i < LMS_FILTER_LENGTH; i++) {
+        lmsFilterWeights[i] = 0.0;
+    }
+ 
+ 
+    while(1){
+        // No polling or for loop delays
+    }
+}
+ 
+ 
+// This ISR version only trigger ADC conversion when Timer A rolls over
+// You will have to disable the interrupt and then re enable the interrupt post computing
+void TA0_0_IRQHandler(){
+    ADC14_toggleConversionTrigger();    // Trigger ADC conversion
+    while(ADC14_isBusy()){}             //
+    VoiceMic = ADC14_getResult(ADC_MEM0); //Note to self: need to make sure this is a 14 bit capable register. if it is not we will need to read the high bit and the low bit and then combine the two
+    ErrorMic = ADC14_getResult(ADC_MEM1); //Same note as above
+ 
+    // Update circular buffers
+    x_buffer[x_index] = (double)VoiceMic;
+    e_buffer[e_index] = (double)ErrorMic;
+    d_buffer[d_index] = /* some value for d, you need to decide */;
+ 
+ 
+    // Increment circular buffer indices
+    x_index = (x_index + 1) % BUFFER_SIZE;
+    e_index = (e_index + 1) % BUFFER_SIZE;
+    d_index = (d_index + 1) % BUFFER_SIZE;
+ 
+    donlms(&x_buffer, &d_buffer, &lmsFilterOutput, &e_buffer, lmsFilterWeights, mu, N, xlen);
+ 
+ 
+ 
+    // I2C Data Splitting for the LMS filter output
+    uint16_t lmsFilterOutputInt = (uint16_t)lmsFilterOutput;
+    uint8_t dataLowByte = lmsFilterOutputInt & 0xFF;         // Lower 8 bits
+    uint8_t dataHighByte = (lmsFilterOutputInt >> 8) & 0xFF; // Upper 6 bits
+ 
+    //Send the data to the DAC
+    I2C_masterSendMultiByteStart(EUSCI_B1_BASE, dacAddress);
+    I2C_masterSendMultiByteNext(EUSCI_B1_BASE, dataHighByte);
+    I2C_masterSendMultiByteFinish(EUSCI_B1_BASE, dataLowByte);
+ 
+ 
+    Timer_A_clearCaptureCompareInterrupt(TIMER_A0_BASE,TIMER_A_CAPTURECOMPARE_REGISTER_0); // Clear the timer A0 interrupt
+}
+ 
+ 
+void donlms(double *x, double *d, double *dhat, double *e, double *w, double mu, int N, int xlen)
+{
+ 
+#ifdef NOTDEFINED
+    // lms(x,d,dhat,e,w,xlen,N,mu)
+    // double    *x;               /* pointer to input data buffer */
+    // double    *d;               /* pointer to desired signal buffer */
+    // double    *w;               /* weight vector */
+    // double    *dhat;            /* estimate of d produced by filter */
+    // double    *e;               /* error */
+    // int        xlen;            /* length of input data buffer */
+    // int        N;               /* filter length */
+    // double     mu;              /* mu = 2 x's the conventional mu */
+#endif
+ 
+    /* Note: the input data is in a buffer that is actually L+N long */
+    /* so there will be enough data to fill the filter taps as well. */
+ 
+    register double s;       /* summer used in filter */
+    register int j,i;        /* loop counters */
+    double *x1;              /* temporary pointer to input data */
+    double *x2;              /* temporary pointer to input data */
+    double *wn,*wn0,*ee;     /* temporary pointer to filter weights */
+    double Em = 1e-20;
+ 
+    for(i=0; i<N; i++) {
+        Em += x[i] * x[i];
+    }
+ 
+    for(i=N; i< xlen; i++)
+ 
+        // Update learning rate based on the energy of the input signal
+        double inputEnergy = 0.0;
+    for (int j = 0; j < N; j++)
+        inputEnergy += x[i - j] * x[i - j];
+ 
+    // Adapt the learning rate (mu) based on the energy of the input signal
+    *mu = 0.01 / (inputEnergy + 1.0);
+ 
+    // Increment circular buffer indices
+    x_index = (x_index + 1) % BUFFER_SIZE;
+    e_index = (e_index + 1) % BUFFER_SIZE;
+    d_index = (d_index + 1) % BUFFER_SIZE;
+ 
+    {
+        for(wn = w, x1=x+i, j=0,s=0.0; j<N; j++)
+            s += *(wn++) * *(x1--);
+        x1++;
+        Em += x[i] * x[i] - *x1 * *x1;
+        e[i] = d[i] - s;
+        dhat[i] = s;
+        s = mu * e[i] / Em;
+        for(j=0; j<N; j++)
+            w[j] += s * x[i-j];
+    }
+}
